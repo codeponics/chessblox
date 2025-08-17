@@ -9,6 +9,9 @@
       },
       "Packages": {
         "$path": "Packages"
+      },
+      "ClientChessUI": {
+        "$path": "src/client_chess_ui"
       }
     },
 
