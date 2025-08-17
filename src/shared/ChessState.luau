@@ -194,19 +194,6 @@ function ChessState.GetCastlingRights()
     }
 end
 
-function ChessState.SetCastlingRights(newRights)
-    if not newRights then return end
-    -- defensive assignments: only change if provided
-    if newRights.white then
-        if newRights.white.k ~= nil then castling.white.k = newRights.white.k end
-        if newRights.white.q ~= nil then castling.white.q = newRights.white.q end
-    end
-    if newRights.black then
-        if newRights.black.k ~= nil then castling.black.k = newRights.black.k end
-        if newRights.black.q ~= nil then castling.black.q = newRights.black.q end
-    end
-end
-
 -- Replace internal board & castling with exact copies (atomic restore for trials)
 function ChessState.RestoreBoard(boardCopy, castlingCopy)
     board = {}

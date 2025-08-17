@@ -66,7 +66,9 @@ GetOrCreateMatch.OnServerInvoke = function(player)
 		assignedSide = (match.players.white == player.UserId and match.players.black == player.UserId) and nil
 					   or (match.players.white == player.UserId and "w")
 					   or (match.players.black == player.UserId and "b")
-					   or nil
+					   or nil,
+		-- include authoritative castling rights so clients can mirror engine state
+		castlingRights = (match.chessState and type(match.chessState.GetCastlingRights) == "function") and match.chessState.GetCastlingRights() or nil,
 	}
 	-- ensure player is participant
 	match.participants[player.UserId] = true
@@ -224,6 +226,31 @@ RequestMove.OnServerInvoke = function(player, request)
 		analysis = ChessAdapter.analyzePosition(match.chessState.GetBoard(), match.sideToMove, ChessConstants.FILES, match.lastMove)
 	end)
 
+
+    -- debug: enumerate candidate moves and safe flags from engine (very verbose; remove in production)
+    local okDbg, dbgInfo = pcall(function()
+        if type(ChessAdapter.debugAnalyze) == "function" then
+            return ChessAdapter.debugAnalyze(match.chessState.GetBoard(), match.sideToMove, ChessConstants.FILES, match.lastMove)
+        end
+        return nil
+    end)
+    if okDbg and dbgInfo then
+        pcall(function()
+            print(string.format("[MoveAuthority][DEBUG] castlingRights: w.k=%s w.q=%s b.k=%s b.q=%s",
+                tostring(dbgInfo.castlingRights and dbgInfo.castlingRights.white and dbgInfo.castlingRights.white.k),
+                tostring(dbgInfo.castlingRights and dbgInfo.castlingRights.white and dbgInfo.castlingRights.white.q),
+                tostring(dbgInfo.castlingRights and dbgInfo.castlingRights.black and dbgInfo.castlingRights.black.k),
+                tostring(dbgInfo.castlingRights and dbgInfo.castlingRights.black and dbgInfo.castlingRights.black.q)))
+            print("[MoveAuthority][DEBUG] pos board string (snippet):")
+            local s = tostring(dbgInfo.posString or "")
+            print(string.sub(s,1,200)) -- print short snippet to avoid huge logs
+            print("[MoveAuthority][DEBUG] Candidate moves (from->to, safe):")
+            for i,cm in ipairs(dbgInfo.candidateMoves) do
+                print(string.format("  #%d  %s -> %s   safe=%s   (mi=%d mj=%d)", i, tostring(cm.from), tostring(cm.to), tostring(cm.safe), tonumber(cm.mi) or -1, tonumber(cm.mj) or -1))
+            end
+        end)
+    end
+
 	-- build payload to send to participants (authoritative)
 	local payload = {
 		matchId = match.id,
@@ -233,6 +260,8 @@ RequestMove.OnServerInvoke = function(player, request)
 		sideToMove = match.sideToMove,
 		analysis = analysis,
 		initiator = player.UserId,
+		-- include authoritative castling rights so clients can mirror engine state
+		castlingRights = (match.chessState and type(match.chessState.GetCastlingRights) == "function") and match.chessState.GetCastlingRights() or nil,
 	}
 
 	-- Targeted broadcast to participants (safe)

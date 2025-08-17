@@ -63,17 +63,30 @@ function DragController.new(pieceManager, boardRefs, chessStateModule, files, si
 
 	-- beginDrag
 	function self:beginDrag(piece, input)
-		if not piece or self.dragging then return end
+		-- basic guards
+        if not piece or self.dragging then return end
 
-		-- Check permission: ensure piece belongs to side to move
-		local side = nil
-		if type(self.sideToMoveProvider) == "function" then
-			side = self.sideToMoveProvider()
-		end
-		local sym = piece:GetAttribute("PieceSymbol")
-		local isWhite = sym and (sym:upper() == sym)
-		if side == "w" and not isWhite then return end
-		if side == "b" and isWhite then return end
+        -- Check permission: ensure piece belongs to side to move
+        local side = nil
+        if type(self.sideToMoveProvider) == "function" then
+            side = self.sideToMoveProvider()
+        end
+        -- Block dragging entirely if the side to move is checkmated
+        -- Use ChessState from self.chessState and lastMoveProvider to compute full analysis
+        local okAnal, analysis = pcall(function()
+            local boardMap = (self.chessState and type(self.chessState.GetBoard) == "function") and self.chessState.GetBoard() or {}
+            local lastMv = (type(self.lastMoveProvider) == "function") and self.lastMoveProvider() or nil
+            return ChessAdapter.analyzePosition(boardMap, side, self.FILES, lastMv)
+        end)
+        if okAnal and analysis and analysis.isCheckmate then
+            return
+        end
+
+        -- existing ownership check (piece belongs to side)
+        local sym = piece:GetAttribute("PieceSymbol")
+        local isWhite = sym and (sym:upper() == sym)
+        if side == "w" and not isWhite then return end
+        if side == "b" and isWhite then return end
 
 		self.dragging = true
 		self.draggedUI = piece

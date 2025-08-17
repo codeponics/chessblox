@@ -2,6 +2,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local task = task
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ClientMods = ReplicatedStorage:WaitForChild("ClientChessUI")
@@ -57,6 +58,60 @@ local sideToMove = "w"
 local localMovePending = false
 local lastMove = nil -- {from=..., to=..., piece=...}
 
+-- Track most recent authoritative payload time to suppress double-play locally
+local lastAuthoritativeAt = 0
+local AUTHORITATIVE_SUPPRESSION_WINDOW = 0.35 -- seconds to avoid local-sound race
+
+-- Pending local-sound mechanism: schedule local sound with small delay and cancel if authoritative arrives
+local pendingLocalSound = nil -- { type = "check"|"checkmate", ts = tick(), timerId = <handle> }
+
+local function scheduleLocalSound(soundType, delaySec)
+	-- cancel any existing pending if it's the same or lower priority
+	if pendingLocalSound then
+		-- if server already gave authoritative recently, skip scheduling
+		if tick() - lastAuthoritativeAt < AUTHORITATIVE_SUPPRESSION_WINDOW then
+			return
+		end
+		-- If an existing pending is checkmate, keep it (higher priority)
+		if pendingLocalSound.type == "checkmate" and soundType == "check" then
+			return
+		end
+		-- cancel existing
+		pendingLocalSound = nil
+	end
+
+	local ts = tick()
+	pendingLocalSound = { type = soundType, ts = ts }
+
+	-- schedule a delayed playback (will be canceled if authoritative payload arrives in the meantime)
+	local handle = task.delay(delaySec or 0.25, function()
+		-- only play if still pending and timestamp matches and no authoritative update arrived
+		if not pendingLocalSound then return end
+		if pendingLocalSound.ts ~= ts then return end
+		-- if authoritative recently arrived, skip
+		if tick() - lastAuthoritativeAt < AUTHORITATIVE_SUPPRESSION_WINDOW then
+			pendingLocalSound = nil
+			return
+		end
+		if pendingLocalSound.type == "checkmate" then
+			pcall(function() SoundManager.playCheckmate() end)
+		elseif pendingLocalSound.type == "check" then
+			pcall(function() SoundManager.playCheck() end)
+		end
+		pendingLocalSound = nil
+	end)
+
+	-- store handle (not strictly required, but useful if we wanted to explicitly cancel)
+	pendingLocalSound.timerId = handle
+end
+
+local function cancelPendingLocalSound()
+	if pendingLocalSound then
+		-- There's not a direct cancel handle for task.delay; we clear the pending flag so the callback no-ops
+		pendingLocalSound = nil
+	end
+end
+
 -- Turn label
 local turnLabel = Instance.new("TextLabel")
 turnLabel.Name = "TurnLabel"
@@ -77,7 +132,7 @@ end
 updateTurnLabel()
 
 -- Create PieceManager and populate
-local pieceManager = PieceManager.new(boardRefs, ChessConstants.PIECE_ASSET_BY_SYMBOL, ChessConstants.PIECE_ASSET_BY_SYMBOL.K or "", 30)
+local pieceManager = require(ClientMods:WaitForChild("PieceManager")).new(boardRefs, ChessConstants.PIECE_ASSET_BY_SYMBOL, ChessConstants.PIECE_ASSET_BY_SYMBOL.K or "", 30)
 pieceManager:populateFromState(ChessState.GetBoard())
 
 -- small helper: attach drag handlers to all current pieces
@@ -105,7 +160,7 @@ local function boardSignature(board)
 	return table.concat(parts)
 end
 
--- Reconcile client's ChessState with authoritative board table
+-- Reconcile client's ChessState with authoritative board table (pieces only; castling rights handled via payload)
 local function reconcileLocalChessStateToBoard(board)
 	if not board then return end
 	local localBoard = ChessState.GetBoard() or {}
@@ -130,6 +185,14 @@ local function reconcileLocalChessStateToBoard(board)
 			-- different symbol -> set to server value
 			pcall(function() ChessState.SetPiece(sq, serverSym) end)
 		end
+	end
+end
+
+-- set castling rights safely if module supports it
+local function setLocalCastlingRightsIfPresent(rights)
+	if not rights then return end
+	if type(ChessState.SetCastlingRights) == "function" then
+		pcall(function() ChessState.SetCastlingRights(rights) end)
 	end
 end
 
@@ -168,7 +231,6 @@ do
 	local ok, resp = pcall(function() return GetOrCreateMatch:InvokeServer() end)
 	if ok and resp and resp.success and resp.payload then
 		myMatchId = resp.payload.matchId
-		-- set assigned side if server provided one (nil => both)
 		-- initialize local state from payload
 		local board = resp.payload.board
 		if board then
@@ -179,6 +241,11 @@ do
 		end
 		sideToMove = resp.payload.sideToMove or sideToMove
 		lastMove = resp.payload.lastMove or lastMove
+		-- set castling rights if present
+		if resp.payload.castlingRights then
+			setLocalCastlingRightsIfPresent(resp.payload.castlingRights)
+		end
+		lastAuthoritativeAt = tick()
 	else
 		-- fallback: proceed without matchId (older servers). myMatchId stays nil.
 		warn("[GenerateBoard] GetOrCreateMatch failed; proceeding without matchId.")
@@ -249,7 +316,6 @@ local function playSoundForMetaOrAnalysis(meta, analysis)
 end
 
 -- onMoveCallback: called by DragController finalizer when user completes a move (promotion already chosen)
--- We'll use this orchestrator callback to call the server and await authoritative response.
 local function onMoveCallback(fromSquare, toSquare, meta)
 	-- mark optimistic local pending (DragController already moved UI)
 	localMovePending = true
@@ -286,7 +352,7 @@ local function onMoveCallback(fromSquare, toSquare, meta)
 		return
 	end
 
-	-- If server responded false/invalid structure
+	-- If RPC returned non-table
 	if not resp or type(resp) ~= "table" then
 		warn("[GenerateBoard] RequestMove returned bad response")
 		if lastBoardSnapshot then
@@ -333,6 +399,19 @@ local function onMoveCallback(fromSquare, toSquare, meta)
 		localMovePending = false
 		updateTurnLabel()
 
+		-- set castling rights from server if provided
+		if payload.castlingRights then
+			setLocalCastlingRightsIfPresent(payload.castlingRights)
+		end
+		-- debug: print server analysis if present
+		if payload.analysis then
+			print("[GenerateBoard] authoritative analysis received (RequestMove):", "isCheck=", tostring(payload.analysis.isCheck), "isCheckmate=", tostring(payload.analysis.isCheckmate))
+		end
+		lastAuthoritativeAt = tick()
+
+		-- cancel any pending local sound (authoritative will produce correct audio)
+		cancelPendingLocalSound()
+
 		-- play sound based on server-provided meta/analysis (avoid double-play)
 		playSoundForMetaOrAnalysis(payload.meta, payload.analysis)
 	else
@@ -343,6 +422,8 @@ local function onMoveCallback(fromSquare, toSquare, meta)
 		lastBoardSig = boardSignature(board)
 		localMovePending = false
 		updateTurnLabel()
+		lastAuthoritativeAt = tick()
+		cancelPendingLocalSound()
 	end
 end
 
@@ -354,7 +435,7 @@ attachDragToAllPieces(dragCtrl)
 
 -- Listen for server broadcasts (authoritative updates from MoveAuthority.Apply)
 MoveApplied.OnClientEvent:Connect(function(payload)
-	-- payload = { matchId=..., board=..., lastMove=..., meta=..., sideToMove=..., analysis=..., initiator=... }
+	-- payload = { matchId=..., board=..., lastMove=..., meta=..., sideToMove=..., analysis=..., initiator=..., castlingRights=... }
 	if not payload or type(payload) ~= "table" then return end
 
 	-- Filter out broadcasts for other matches
@@ -373,6 +454,20 @@ MoveApplied.OnClientEvent:Connect(function(payload)
 	-- refresh visuals
 	pieceManager:populateFromState(board)
 	attachDragToAllPieces(dragCtrl)
+
+	-- set castling rights if present
+	if payload.castlingRights then
+		setLocalCastlingRightsIfPresent(payload.castlingRights)
+	end
+
+	-- debug logging for authoritative payload analysis
+	if payload.analysis then
+		print("[GenerateBoard] authoritative analysis received (MoveApplied):", "isCheck=", tostring(payload.analysis.isCheck), "isCheckmate=", tostring(payload.analysis.isCheckmate))
+	end
+
+	lastAuthoritativeAt = tick()
+	-- cancel any pending local playback to avoid double-play or wrong sound
+	cancelPendingLocalSound()
 
 	-- consume pending if it was ours (otherwise flip turn)
 	if wasLocal then
@@ -432,13 +527,20 @@ do
 			updateTurnLabel()
 
 			-- analyze new position for the side to move and play check/checkmate if present
-			-- but skip playing if this was the local optimistic move (to avoid double-play)
+			-- but skip playing if this was the local optimistic move (to avoid double-play).
+			-- Instead of playing immediately, schedule a short delayed local playback so authoritative payloads can override it.
 			if not wasLocalPending then
-				local analysis = ChessAdapter.analyzePosition(board, sideToMove, FILES, lastMove)
-				if analysis and analysis.isCheckmate then
-					pcall(function() SoundManager.playCheckmate() end)
-				elseif analysis and analysis.isCheck then
-					pcall(function() SoundManager.playCheck() end)
+				-- Do not schedule local sound if an authoritative update was very recent
+				if tick() - lastAuthoritativeAt < AUTHORITATIVE_SUPPRESSION_WINDOW then
+					-- skip: authoritative likely handled the sound
+				else
+					local analysis = ChessAdapter.analyzePosition(board, sideToMove, FILES, lastMove)
+					if analysis and analysis.isCheckmate then
+						-- schedule checkmate playback; authoritative can cancel or override
+						scheduleLocalSound("checkmate", 0.25)
+					elseif analysis and analysis.isCheck then
+						scheduleLocalSound("check", 0.25)
+					end
 				end
 			end
 		end
