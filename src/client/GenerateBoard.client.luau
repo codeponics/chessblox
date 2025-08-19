@@ -39,7 +39,7 @@ local function getConfiguredPlayerSide(screenGui)
 end
 
 -- Build board UI
-local FILES = ChessConstants.FILES or {"a","b","c","d","e","f","g","h"}
+local FILES = ChessConstants.FILES
 local boardRefs = BoardBuilder.build(FILES, ChessConstants.LIGHT_COLOR, ChessConstants.DARK_COLOR, {
 	BOARD_UI_SCALE = 0.6,
 	BOARD_Z_INDEX = 10,
@@ -132,7 +132,7 @@ end
 updateTurnLabel()
 
 -- Create PieceManager and populate
-local pieceManager = require(ClientMods:WaitForChild("PieceManager")).new(boardRefs, ChessConstants.PIECE_ASSET_BY_SYMBOL, ChessConstants.PIECE_ASSET_BY_SYMBOL.K or "", 30)
+local pieceManager = PieceManager.new(boardRefs, ChessConstants.PIECE_ASSET_BY_SYMBOL, ChessConstants.PIECE_ASSET_BY_SYMBOL.K, 30)
 pieceManager:populateFromState(ChessState.GetBoard())
 
 -- small helper: attach drag handlers to all current pieces
