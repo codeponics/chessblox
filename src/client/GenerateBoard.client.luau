@@ -62,56 +62,6 @@ local lastMove = nil -- {from=..., to=..., piece=...}
 local lastAuthoritativeAt = 0
 local AUTHORITATIVE_SUPPRESSION_WINDOW = 0.35 -- seconds to avoid local-sound race
 
--- Pending local-sound mechanism: schedule local sound with small delay and cancel if authoritative arrives
-local pendingLocalSound = nil -- { type = "check"|"checkmate", ts = tick(), timerId = <handle> }
-
-local function scheduleLocalSound(soundType, delaySec)
-	-- cancel any existing pending if it's the same or lower priority
-	if pendingLocalSound then
-		-- if server already gave authoritative recently, skip scheduling
-		if tick() - lastAuthoritativeAt < AUTHORITATIVE_SUPPRESSION_WINDOW then
-			return
-		end
-		-- If an existing pending is checkmate, keep it (higher priority)
-		if pendingLocalSound.type == "checkmate" and soundType == "check" then
-			return
-		end
-		-- cancel existing
-		pendingLocalSound = nil
-	end
-
-	local ts = tick()
-	pendingLocalSound = { type = soundType, ts = ts }
-
-	-- schedule a delayed playback (will be canceled if authoritative payload arrives in the meantime)
-	local handle = task.delay(delaySec or 0.25, function()
-		-- only play if still pending and timestamp matches and no authoritative update arrived
-		if not pendingLocalSound then return end
-		if pendingLocalSound.ts ~= ts then return end
-		-- if authoritative recently arrived, skip
-		if tick() - lastAuthoritativeAt < AUTHORITATIVE_SUPPRESSION_WINDOW then
-			pendingLocalSound = nil
-			return
-		end
-		if pendingLocalSound.type == "checkmate" then
-			pcall(function() SoundManager.playCheckmate() end)
-		elseif pendingLocalSound.type == "check" then
-			pcall(function() SoundManager.playCheck() end)
-		end
-		pendingLocalSound = nil
-	end)
-
-	-- store handle (not strictly required, but useful if we wanted to explicitly cancel)
-	pendingLocalSound.timerId = handle
-end
-
-local function cancelPendingLocalSound()
-	if pendingLocalSound then
-		-- There's not a direct cancel handle for task.delay; we clear the pending flag so the callback no-ops
-		pendingLocalSound = nil
-	end
-end
-
 -- Turn label
 local turnLabel = Instance.new("TextLabel")
 turnLabel.Name = "TurnLabel"
@@ -409,9 +359,6 @@ local function onMoveCallback(fromSquare, toSquare, meta)
 		end
 		lastAuthoritativeAt = tick()
 
-		-- cancel any pending local sound (authoritative will produce correct audio)
-		cancelPendingLocalSound()
-
 		-- play sound based on server-provided meta/analysis (avoid double-play)
 		playSoundForMetaOrAnalysis(payload.meta, payload.analysis)
 	else
@@ -423,7 +370,6 @@ local function onMoveCallback(fromSquare, toSquare, meta)
 		localMovePending = false
 		updateTurnLabel()
 		lastAuthoritativeAt = tick()
-		cancelPendingLocalSound()
 	end
 end
 
@@ -466,8 +412,6 @@ MoveApplied.OnClientEvent:Connect(function(payload)
 	end
 
 	lastAuthoritativeAt = tick()
-	-- cancel any pending local playback to avoid double-play or wrong sound
-	cancelPendingLocalSound()
 
 	-- consume pending if it was ours (otherwise flip turn)
 	if wasLocal then
