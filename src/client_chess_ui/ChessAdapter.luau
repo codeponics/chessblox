@@ -158,14 +158,14 @@ local function isSquareAttackedByOpponent(pos, sqAlgebraic, side)
 	local oppPos = pos:rotate()
 	-- compute the target index in oppPos coordinate system
 	local targetIdx
-	local parsed = parseSquareToIndex(sqAlgebraic)
-	if not parsed then return false end
 	if side == "w" then
 		-- when pos is oriented for white, opponent view index is 119 - parseIndex
+		local parsed = parseSquareToIndex(sqAlgebraic)
+		if not parsed then return false end
 		targetIdx = 119 - parsed
 	else
 		-- when pos is oriented for black, parseSquareToIndex already returned index suitable
-		targetIdx = parsed
+		targetIdx = parseSquareToIndex(sqAlgebraic)
 	end
 	for _, m in ipairs(oppPos:genMoves()) do
 		if m[2] == targetIdx then
@@ -226,8 +226,30 @@ function ChessAdapter.validateMove(boardMap, fromSquare, toSquare, side, FILES, 
 
 	FILES = FILES or (require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("ChessConstants")).FILES)
 
+	local boardStr = buildBoardStringFromMap(boardMap, FILES)
+
+	-- compute ep square index
+	local epSquare = nil
+	if lastMove and lastMove.piece and lastMove.piece:upper() == "P" then
+		local fromR = tonumber(lastMove.from:sub(2,2))
+		local toR = tonumber(lastMove.to:sub(2,2))
+		if fromR and toR and math.abs(toR - fromR) == 2 then
+			local file = lastMove.to:sub(1,1)
+			local epRank = (fromR + toR) / 2
+			epSquare = file .. tostring(epRank)
+		end
+	end
+	local epIndex = 0
+	if epSquare then epIndex = parseSquareToIndex(epSquare) or 0 end
+
+	-- castling rights to pass to engine
+	local rights = ChessState.GetCastlingRights and ChessState.GetCastlingRights() or { white = {k=true,q=true}, black = {k=true,q=true} }
+	local whiteRightsArr = { rights.white.q == true, rights.white.k == true }
+	local blackRightsArr = { rights.black.q == true, rights.black.k == true }
+
 	-- build position and rotate if black
-	local pos = buildPosFromBoard(boardMap, side, FILES, lastMove)
+	local pos = Chess.Position.new(boardStr, 0, whiteRightsArr, blackRightsArr, epIndex, 0)
+	if side == "b" then pos = pos:rotate() end
 
 	local fromIdx = parseSquareToIndex(fromSquare)
 	local toIdx = parseSquareToIndex(toSquare)
@@ -262,39 +284,86 @@ function ChessAdapter.validateMove(boardMap, fromSquare, toSquare, side, FILES, 
 		meta.rookFrom = rookFrom
 		meta.rookTo = rookTo
 
-		local rights = ChessState.GetCastlingRights and ChessState.GetCastlingRights() or { white = {k=true,q=true}, black = {k=true,q=true} }
+		-- small debug helper (kept from original)
+		local function dbg(msg)
+			-- comment/uncomment print as needed for debug
+			-- print(string.format("[ChessAdapter][castling] %s | from=%s to=%s side=%s rookFrom=%s rookTo=%s",
+			-- 	 tostring(msg), tostring(fromSquare), tostring(toSquare), tostring(side), tostring(rookFrom), tostring(rookTo)))
+		end
+
+		dbg("entered castling checks")
 
 		-- 1) ensure castling right present
 		local kingSide = (rookFrom:sub(1,1) == "h")
 		if side == "w" then
-			if (kingSide and not rights.white.k) or (not kingSide and not rights.white.q) then return false, nil end
+			if kingSide and (not rights.white.k) then dbg("reject: missing white.k right"); return false, nil end
+			if (not kingSide) and (not rights.white.q) then dbg("reject: missing white.q right"); return false, nil end
 		else
-			if (kingSide and not rights.black.k) or (not kingSide and not rights.black.q) then return false, nil end
+			if kingSide and (not rights.black.k) then dbg("reject: missing black.k right"); return false, nil end
+			if (not kingSide) and (not rights.black.q) then dbg("reject: missing black.q right"); return false, nil end
 		end
+		dbg("passed rights check")
 
 		-- 2) ensure rook exists and of correct color
 		local rookPiece = boardMap and boardMap[rookFrom] or nil
-		if not rookPiece then return false, nil end
-		if (side == "w" and rookPiece ~= "R") or (side == "b" and rookPiece ~= "r") then return false, nil end
+		if not rookPiece then dbg("reject: rook missing on rookFrom"); return false, nil end
+		if side == "w" and rookPiece ~= "R" then dbg("reject: rook on rookFrom wrong color (not R)"); return false, nil end
+		if side == "b" and rookPiece ~= "r" then dbg("reject: rook on rookFrom wrong color (not r)"); return false, nil end
+		dbg("passed rook presence/color check")
 
 		-- 3) ensure blocking squares are empty
 		local rank = fromSquare:sub(2,2)
 		if kingSide then
-			if boardMap["f" .. rank] ~= nil or boardMap["g" .. rank] ~= nil then return false, nil end
+			local s1 = ("f" .. rank)
+			local s2 = ("g" .. rank)
+			if boardMap[s1] ~= nil or boardMap[s2] ~= nil then
+				dbg("reject: blocking piece(s) between king and rook on kingside: " .. tostring(s1) .. "," .. tostring(s2))
+				return false, nil
+			end
 		else
-			if boardMap["b" .. rank] ~= nil or boardMap["c" .. rank] ~= nil or boardMap["d" .. rank] ~= nil then return false, nil end
+			local s1 = ("b" .. rank)
+			local s2 = ("c" .. rank)
+			local s3 = ("d" .. rank)
+			if boardMap[s1] ~= nil or boardMap[s2] ~= nil or boardMap[s3] ~= nil then
+				dbg("reject: blocking piece(s) between king and rook on queenside: " .. tostring(s1) .. "," .. tostring(s2) .. "," .. tostring(s3))
+				return false, nil
+			end
 		end
+		dbg("passed empty-squares check")
 
 		-- 4) ensure king is present and not currently in check
-		local kingSquare = (side == "w") and "e1" or "e8" -- Assumes king hasn't moved for castling
-		if isSquareAttackedByOpponent(pos, kingSquare, side) then return false, nil end
+		local kingSquare = nil
+		for sq, sym in pairs(boardMap or {}) do
+			if side == "w" and sym == "K" then kingSquare = sq; break end
+			if side == "b" and sym == "k" then kingSquare = sq; break end
+		end
+		if not kingSquare then
+			dbg("reject: no king found on boardMap")
+			return false, nil
+		end
+		if isSquareAttackedByOpponent(pos, kingSquare, side) then
+			dbg("reject: king currently in check at " .. tostring(kingSquare))
+			return false, nil
+		end
+		dbg("passed current-check test")
 
 		-- 5) the squares the king passes through (and lands on) must not be attacked
 		if kingSide then
-			if isSquareAttackedByOpponent(pos, "f" .. rank, side) or isSquareAttackedByOpponent(pos, "g" .. rank, side) then return false, nil end
+			local pass1 = ("f" .. rank)
+			local pass2 = ("g" .. rank)
+			if isSquareAttackedByOpponent(pos, pass1, side) or isSquareAttackedByOpponent(pos, pass2, side) then
+				dbg("reject: castling squares attacked on kingside: " .. tostring(pass1) .. "," .. tostring(pass2))
+				return false, nil
+			end
 		else
-			if isSquareAttackedByOpponent(pos, "c" .. rank, side) or isSquareAttackedByOpponent(pos, "d" .. rank, side) then return false, nil end
+			local pass1 = ("d" .. rank)
+			local pass2 = ("c" .. rank)
+			if isSquareAttackedByOpponent(pos, pass1, side) or isSquareAttackedByOpponent(pos, pass2, side) then
+				dbg("reject: castling squares attacked on queenside: " .. tostring(pass1) .. "," .. tostring(pass2))
+				return false, nil
+			end
 		end
+		dbg("passed crossing-squares attack checks")
 	end
 
 	meta.candidateMove = candidate
@@ -308,42 +377,65 @@ function ChessAdapter.isSideInCheck(boardMap, side, FILES, lastMove)
 	-- find king square algebraically
 	local kingSquare = nil
 	for sq, sym in pairs(boardMap or {}) do
-		if (side == "w" and sym == "K") or (side == "b" and sym == "k") then
-			kingSquare = sq
-			break
-		end
+		if side == "w" and sym == "K" then kingSquare = sq; break end
+		if side == "b" and sym == "k" then kingSquare = sq; break end
 	end
 	if not kingSquare then return false end
 	return isSquareAttackedByOpponent(pos, kingSquare, side)
 end
 
+
 -- Analyze: isCheck, isCheckmate, isStalemate for given side
 function ChessAdapter.analyzePosition(boardMap, side, FILES, lastMove)
-	FILES = FILES or (require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("ChessConstants")).FILES)
-	local pos = buildPosFromBoard(boardMap, side, FILES, lastMove)
+    FILES = FILES or (require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("ChessConstants")).FILES)
+    local pos = buildPosFromBoard(boardMap, side, FILES, lastMove)
 
-	-- is in check?
-	local inCheck = ChessAdapter.isSideInCheck(boardMap, side, FILES, lastMove)
+    -- is in check?
+    local inCheck = ChessAdapter.isSideInCheck(boardMap, side, FILES, lastMove)
 
-	-- Check if any pseudo-legal move is actually legal
-	local anyLegal = false
-	for _, m in ipairs(pos:genMoves()) do
-		-- FIX: The core of move legality is whether it leaves the king in check.
-		-- By calling this directly, we avoid the circular dependency on validateMove.
-		if moveDoesNotLeaveKingInCheck(pos, m) then
-			anyLegal = true
-			break
-		end
-	end
+    -- Build index -> algebraic square map for mapping generated moves back to algebraic coords
+    local indexToSquare = {}
+    for _, f in ipairs(FILES) do
+        for r = 1,8 do
+            local sq = f .. tostring(r)
+            local idx = parseSquareToIndex(sq)
+            if idx then indexToSquare[idx] = sq end
+        end
+    end
+    local function idxToAlgebraic(mi_or_mj, sideForPos)
+        if sideForPos == "b" then
+            local orig = 119 - mi_or_mj
+            return indexToSquare[orig] or tostring(orig)
+        else
+            return indexToSquare[mi_or_mj] or tostring(mi_or_mj)
+        end
+    end
 
-	local isCheckmate = (inCheck and not anyLegal)
-	local isStalemate  = (not inCheck and not anyLegal)
+    -- generate moves for 'side' and check if any are legal using the adapter's full validation
+    local anyLegal = false
+    for _, m in ipairs(pos:genMoves()) do
+        local mi, mj = m[1], m[2]
+        local fromSq = idxToAlgebraic(mi, side)
+        local toSq   = idxToAlgebraic(mj, side)
 
-	return {
-		isCheck = inCheck,
-		isCheckmate = isCheckmate,
-		isStalemate = isStalemate
-	}
+        -- attempt adapter-level validation for this candidate move:
+        local ok, valid = pcall(function()
+            return ChessAdapter.validateMove(boardMap, fromSq, toSq, side, FILES, lastMove)
+        end)
+        if ok and valid then
+            anyLegal = true
+            break
+        end
+    end
+
+    local isCheckmate = (inCheck and not anyLegal)
+    local isStalemate  = (not inCheck and not anyLegal)
+
+    return {
+        isCheck = inCheck,
+        isCheckmate = isCheckmate,
+        isStalemate = isStalemate
+    }
 end
 
 -- Debug helper: enumerate generated moves in algebraic coordinates and whether they pass king-safety test.
@@ -386,13 +478,13 @@ function ChessAdapter.debugAnalyze(boardMap, side, FILES, lastMove)
 		if not fromSq or type(fromSq) ~= "string" then fromSq = "?" end
 		if not toSq   or type(toSq)   ~= "string" then toSq   = "?" end
 
-		-- Determine whether this candidate leaves king safe according to full adapter logic
-		local okSafe = false
-		local safeOk, safeRes = pcall(function()
-			-- From/to are computed above as fromSq/toSq
-			return ChessAdapter.validateMove(boardMap, fromSq, toSq, side, FILES, lastMove)
-		end)
-		if safeOk and safeRes then okSafe = true end
+        -- Determine whether this candidate leaves king safe according to full adapter logic
+        local okSafe = false
+        local safeOk, safeRes = pcall(function()
+            -- From/to are computed above as fromSq/toSq
+            return ChessAdapter.validateMove(boardMap, fromSq, toSq, side, FILES, lastMove)
+        end)
+        if safeOk and safeRes then okSafe = true end
 
 		table.insert(out.candidateMoves, {
 			from = fromSq,

@@ -32,4 +32,10 @@ return {
     },
     LIGHT_COLOR = Color3.fromRGB(240,217,181),  -- light square
     DARK_COLOR  = Color3.fromRGB(181,136,99),   -- dark square
+    SOUNDS = {
+        MOVE = "rbxassetid://98240421775374",      -- ordinary move (non-capture)
+        CAPTURE = "rbxassetid://98240421775374",   -- capture sound
+        CASTLE = "rbxassetid://98240421775374",    -- castle-specific sound (chess.com has one)
+        PROMOTE = "rbxassetid://98240421775374",   -- promotion sound (optional)
+    }
 }
